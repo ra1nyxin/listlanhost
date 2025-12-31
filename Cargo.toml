@@ -1,0 +1,16 @@
+[package]
+name = "listlanhost"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+default-net = "0.14"
+tabled = { version = "0.15", features = ["derive"] }
+colored = "2.1"
+indicatif = "0.17"
+ipnetwork = "0.20"
+
+[profile.release]
+panic = 'abort'     # 移除异常展开逻辑
+strip = true        # 自动去除符号表
