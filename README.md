@@ -1,3 +1,5 @@
+<img width="1100" height="269" alt="image" src="https://github.com/user-attachments/assets/441a348a-d2f4-48b2-8c10-884164c91486" />
+
 # listlanhost (lslh)
 
 A high-concurrency LAN host discovery tool written in Rust.
