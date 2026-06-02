@@ -2,7 +2,7 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnetwork::Ipv4Network;
 use std::env;
-use std::fs::File;
+use std::fs::{create_dir_all, File};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -83,6 +83,12 @@ const NETBIOS_QUERY: &[u8] = &[
     0x41, 0x00, 0x00, 0x21, 0x00, 0x01,
 ];
 
+const DNS_QUERY: &[u8] = &[
+    0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c',
+    b'o', b'm', 0x00, 0x00, 0x01, 0x00, 0x01,
+];
+
 const SSDP_M_SEARCH: &[u8] = b"M-SEARCH * HTTP/1.1\r\n\
 HOST: 239.255.255.250:1900\r\n\
 MAN: \"ssdp:discover\"\r\n\
@@ -110,9 +116,9 @@ const TCP_PROBES: &[TcpProbe] = &[
     TcpProbe { port: 81, label: "HTTP-Alt 摄像头后台", hint: "Camera/Admin 摄像头后台" },
     TcpProbe { port: 88, label: "HTTP-Alt 摄像头后台", hint: "Camera/Admin 摄像头后台" },
     TcpProbe { port: 135, label: "MSRPC Windows", hint: "Windows 主机" },
-    TcpProbe { port: 139, label: "NetBIOS 共享", hint: "Windows/NAS 共享/NAS" },
+    TcpProbe { port: 139, label: "NetBIOS 共享", hint: "Windows/NAS 共享设备" },
     TcpProbe { port: 443, label: "HTTPS 后台", hint: "Web/Admin 网页后台" },
-    TcpProbe { port: 445, label: "SMB 共享", hint: "Windows/NAS 共享/NAS" },
+    TcpProbe { port: 445, label: "SMB 共享", hint: "Windows/NAS 共享设备" },
     TcpProbe { port: 554, label: "RTSP 视频流", hint: "Camera/NVR 摄像头/录像机" },
     TcpProbe { port: 631, label: "IPP 打印", hint: "Printer 打印机" },
     TcpProbe { port: 1900, label: "SSDP 发现", hint: "UPnP/IoT 智能设备" },
@@ -139,8 +145,9 @@ const TCP_PROBES: &[TcpProbe] = &[
 ];
 
 const UDP_PROBES: &[UdpProbe] = &[
+    UdpProbe { port: 53, label: "DNS 查询", hint: "Router/DNS 路由器/DNS", payload: DNS_QUERY },
     UdpProbe { port: 67, label: "DHCP 地址分配", hint: "DHCP/Router DHCP/路由器", payload: &[] },
-    UdpProbe { port: 137, label: "NetBIOS 主机名", hint: "NetBIOS/Windows 主机名/Windows", payload: NETBIOS_QUERY },
+    UdpProbe { port: 137, label: "NetBIOS 主机名", hint: "NetBIOS 主机名响应", payload: NETBIOS_QUERY },
     UdpProbe { port: 1900, label: "SSDP 发现", hint: "UPnP/IoT 智能设备", payload: SSDP_M_SEARCH },
     UdpProbe { port: 3702, label: "WS-Discovery/ONVIF 摄像头", hint: "ONVIF/Camera 摄像头", payload: WS_DISCOVERY_PROBE },
 ];
@@ -443,7 +450,8 @@ fn count_group(results: &[HostInfo], group: &str) -> usize {
 }
 
 fn apply_combination_hints(hints: &mut Vec<String>, tcp_open: &[u16], udp_open: &[u16]) {
-    if (has_any(tcp_open, &[80, 443, 8080, 8443]) && tcp_open.contains(&53))
+    if (has_any(tcp_open, &[80, 443, 8080, 8443]) && has_any(tcp_open, &[53]))
+        || (has_any(tcp_open, &[80, 443, 8080, 8443]) && udp_open.contains(&53))
         || udp_open.contains(&67)
     {
         push_unique(hints, "Likely Router 路由器可能".to_string());
@@ -546,23 +554,18 @@ async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<HttpProbeInfo> {
         .ok()?
         .ok()?;
 
-    let request = format!("GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: listlanhost/{VERSION}\r\n\r\n");
+    let request = format!(
+        "GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: listlanhost/{VERSION}\r\nAccept: text/html,*/*\r\nConnection: close\r\n\r\n"
+    );
     timeout(APP_PROBE_TIMEOUT, stream.write_all(request.as_bytes()))
         .await
         .ok()?
         .ok()?;
 
-    let mut buf = vec![0u8; 8192];
-    let n = timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-
-    if n == 0 {
+    let response = read_response_text(&mut stream).await?;
+    if response.is_empty() {
         return None;
     }
-
-    let response = String::from_utf8_lossy(&buf[..n]).to_string();
     let status_code = http_status_code(&response);
     let title = html_title(&response);
     let server = header_value(&response, "server");
@@ -621,13 +624,16 @@ async fn probe_rtsp(ip: Ipv4Addr, port: u16) -> Option<RtspProbeInfo> {
 
 impl HttpProbeInfo {
     fn display_line(&self) -> String {
-        let mut parts = vec![format!("{} {}", self.url, status_text(self.status_code))];
+        let mut parts = vec![format!("{} {}", self.url, http_status_text(self.status_code))];
 
         if let Some(title) = &self.title {
             parts.push(format!("Title/标题:{title}"));
         }
         if let Some(server) = &self.server {
             parts.push(format!("Server:{server}"));
+        }
+        if self.title.is_none() && self.server.is_none() {
+            parts.push("no title/server 无标题/Server".to_string());
         }
         if self.auth_required {
             parts.push("Auth required/需要认证".to_string());
@@ -642,7 +648,7 @@ impl HttpProbeInfo {
 
 impl RtspProbeInfo {
     fn display_line(&self) -> String {
-        let mut parts = vec![format!("RTSP:{} {}", self.port, status_text(self.status_code))];
+        let mut parts = vec![format!("RTSP:{} {}", self.port, rtsp_status_text(self.status_code))];
 
         if let Some(server) = &self.server {
             parts.push(format!("Server:{server}"));
@@ -672,10 +678,33 @@ fn rtsp_status_code(response: &str) -> Option<u16> {
     parts.next()?.parse().ok()
 }
 
-fn status_text(status_code: Option<u16>) -> String {
+async fn read_response_text(stream: &mut TcpStream) -> Option<String> {
+    let mut response = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    while response.len() < 32 * 1024 {
+        match timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+            _ if response.is_empty() => return None,
+            _ => break,
+        }
+    }
+
+    Some(String::from_utf8_lossy(&response).to_string())
+}
+
+fn http_status_text(status_code: Option<u16>) -> String {
     match status_code {
-        Some(code) => format!("HTTP/RTSP {code}"),
-        None => "status unknown/状态未知".to_string(),
+        Some(code) => format!("HTTP {code}"),
+        None => "HTTP status unknown/状态未知".to_string(),
+    }
+}
+
+fn rtsp_status_text(status_code: Option<u16>) -> String {
+    match status_code {
+        Some(code) => format!("RTSP {code}"),
+        None => "RTSP status unknown/状态未知".to_string(),
     }
 }
 
@@ -772,7 +801,8 @@ fn write_reports(context: &NetworkContext, results: &[HostInfo]) -> io::Result<V
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let base = format!("listlanhost-report-{timestamp}");
+    create_dir_all("reports")?;
+    let base = format!("reports/listlanhost-report-{}", unix_timestamp_name(timestamp));
     let txt_path = format!("{base}.txt");
     let csv_path = format!("{base}.csv");
     let json_path = format!("{base}.json");
@@ -782,6 +812,32 @@ fn write_reports(context: &NetworkContext, results: &[HostInfo]) -> io::Result<V
     write_json_report(&json_path, context, results)?;
 
     Ok(vec![txt_path, csv_path, json_path])
+}
+
+fn unix_timestamp_name(timestamp: u64) -> String {
+    let days = (timestamp / 86_400) as i64;
+    let seconds_of_day = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+
+    format!("{year:04}-{month:02}-{day:02}-{hour:02}{minute:02}{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+
+    (year as i32, m as u32, d as u32)
 }
 
 fn write_txt_report(path: &str, context: &NetworkContext, results: &[HostInfo]) -> io::Result<()> {

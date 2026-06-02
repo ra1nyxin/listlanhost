@@ -4,7 +4,7 @@
 
 `listlanhost`（简称 `lslh`）是一个使用 Rust 编写的轻量级局域网设备发现工具，适合弱电施工、机房巡检、家庭/办公室网络排查、临时接入设备摸排等场景。
 
-Current version / 当前版本：`0.2.3`
+Current version / 当前版本：`0.2.4`
 
 ## What It Does / 它能做什么
 
@@ -20,10 +20,10 @@ The output includes summary counters, grouped host cards, device hints, web entr
 
 - Summary / 汇总统计：在线主机数、默认网关、疑似摄像头/NVR、路由器/后台、普通后台页面、Windows/NAS、打印机、IoT/UPnP、后台 URL、HTTP/RTSP 详情、指纹线索。
 - Grouped card layout / 分组卡片布局：不再用一张很宽的表格，而是按 Camera/NVR、Router/Admin、Web/Admin、Windows/NAS 等分组输出，终端更容易看。
-- Report files / 自动报告：每次扫描后自动生成 `txt`、`csv`、`json` 三份报告，方便留档、发客户或导入表格。
+- Report files / 自动报告：每次扫描后自动在 `reports/` 目录生成 `txt`、`csv`、`json` 三份报告，文件名使用 UTC 日期时间，方便留档、发客户或导入表格。
 - Web entry URLs / 后台入口：对常见后台端口自动生成 `http://` 或 `https://` URL，方便复制到浏览器。
 - Combined inference / 组合判断：根据多个端口组合推断“更像路由器”“更像摄像头/NVR”“更像 Windows/NAS”“更像打印机”等。
-- HTTP status/title/server probe / HTTP 状态、标题与 Server 探测：对明文 HTTP 后台发起轻量 `GET /`，读取状态码、`<title>` 和 `Server`。
+- HTTP status/title/server probe / HTTP 状态、标题与 Server 探测：对明文 HTTP 后台发起更完整的轻量 `GET /`，读取最多 32KB 响应，提取状态码、`<title>` 和 `Server`；没有标题或 Server 时会明确显示 `no title/server 无标题/Server`。
 - RTSP status/auth probe / RTSP 状态与认证探测：对 `554` 和 `8554` 发送 `OPTIONS * RTSP/1.0`，读取状态码、`Server` 和认证提示。
 - Default gateway marking / 默认网关标记：如果系统能读取默认网关，会单独标记 `DEFAULT GATEWAY / 默认网关`。
 - Vendor/device fingerprinting / 厂商与设备指纹：基于标题、Server、RTSP 响应等识别 Hikvision、Dahua、TP-LINK、OpenWrt、Synology、QNAP、nginx、IIS 等线索。
@@ -39,7 +39,7 @@ The output includes summary counters, grouped host cards, device hints, web entr
 ### Network Infrastructure / 网络基础设施
 
 - Router/admin panels / 路由器与后台页面：`80`, `443`, `8080`, `8443`, `8888`, `9000`, `9090`
-- DNS / DNS 服务：`53`
+- DNS / DNS 服务：TCP/UDP `53`
 - DHCP hint / DHCP 线索：UDP `67`
 - UPnP / IoT discovery / UPnP 与智能设备发现：TCP/UDP `1900`, TCP `2869`
 
@@ -73,8 +73,8 @@ https://github.com/ra1nyxin/listlanhost/releases
 
 Assets / 常见资产：
 
-- `listlanhost-0.2.3-windows-x86_64.exe`
-- `listlanhost-0.2.3-linux-x86_64`
+- `listlanhost-0.2.4-windows-x86_64.exe`
+- `listlanhost-0.2.4-linux-x86_64`
 
 ## Usage / 使用
 
@@ -125,26 +125,26 @@ SCAN RESULTS / 扫描结果:
   Services / 服务: TCP:554(RTSP 视频流) | TCP:8000(HTTP/SDK 摄像头)
   URLs / 后台入口: http://192.168.1.32:8000/
   Fingerprints / 指纹: Hikvision 海康威视
-  RTSP / 视频流详情: RTSP:554 HTTP/RTSP 401; Server:Embedded RTSP; Auth required/需要认证
+  RTSP / 视频流详情: RTSP:554 RTSP 401; Server:Embedded RTSP; Auth required/需要认证
 
 [Router/Admin] 1 host(s)
 192.168.1.1 ONLINE/在线  DEFAULT GATEWAY / 默认网关
   Hints / 线索: Default Gateway 默认网关 | Likely Router 路由器可能
   Services / 服务: SYSTEM:default-gateway(默认网关) | TCP:80(HTTP 后台)
   URLs / 后台入口: http://192.168.1.1/
-  HTTP / 网页详情: http://192.168.1.1/ HTTP/RTSP 200; Title/标题:Router; Fingerprint/指纹:TP-LINK 路由器
+  HTTP / 网页详情: http://192.168.1.1/ HTTP 200; Title/标题:Router; Fingerprint/指纹:TP-LINK 路由器
 
 REPORTS / 报告文件:
-  listlanhost-report-1780000000.txt
-  listlanhost-report-1780000000.csv
-  listlanhost-report-1780000000.json
+  reports/listlanhost-report-2026-06-03-010000Z.txt
+  reports/listlanhost-report-2026-06-03-010000Z.csv
+  reports/listlanhost-report-2026-06-03-010000Z.json
 ```
 
 ## Report Files / 报告文件
 
-The reports are written to the current working directory.
+The reports are written to the `reports/` directory under the current working directory.
 
-报告会写入当前工作目录。
+报告会写入当前工作目录下的 `reports/` 目录。
 
 - `.txt`: human-readable field report / 适合直接查看的现场报告
 - `.csv`: spreadsheet-friendly report / 适合导入 Excel 或表格工具
