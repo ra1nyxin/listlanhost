@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build ${{ matrix.name }}
@@ -23,10 +26,6 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             artifact: listlanhost-0.2.0-linux-x86_64
-            binary: target/release/listlanhost
-          - name: macos-x86_64
-            os: macos-13
-            artifact: listlanhost-0.2.0-macos-x86_64
             binary: target/release/listlanhost
 
     steps:

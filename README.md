@@ -26,7 +26,6 @@ https://github.com/ra1nyxin/listlanhost/releases
 
 - `listlanhost-0.2.0-windows-x86_64.exe`
 - `listlanhost-0.2.0-linux-x86_64`
-- `listlanhost-0.2.0-macos-x86_64`
 
 ## 从源码构建
 
