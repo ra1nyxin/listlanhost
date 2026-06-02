@@ -4,13 +4,27 @@
 
 `listlanhost`（简称 `lslh`）是一个使用 Rust 编写的轻量级局域网设备发现工具，适合弱电施工、机房巡检、家庭/办公室网络排查、临时接入设备摸排等场景。
 
-Current version / 当前版本：`0.2.1`
+Current version / 当前版本：`0.2.2`
 
 ## What It Does / 它能做什么
 
-The tool automatically reads the default network interface, calculates the local IPv4 subnet, scans active hosts concurrently, and prints a compact bilingual result table.
+The tool automatically reads the default network interface, calculates the local IPv4 subnet, scans active hosts concurrently, and prints a bilingual summary and result table.
 
-它会自动读取默认网卡和本机 IPv4 子网，并发扫描网段内的在线主机，最后输出中英双语表格。输出会尽量给出“设备线索”，方便现场人员快速判断设备类型。
+它会自动读取默认网卡和本机 IPv4 子网，并发扫描网段内的在线主机，最后输出中英双语汇总和结果表。
+
+The output includes device groups, service hints, web entry URLs, HTTP title/server details, and RTSP verification when available.
+
+输出会给出设备分组、服务线索、后台入口 URL、HTTP 标题/Server 信息，以及可用时的 RTSP 验证结果，方便现场人员快速判断设备类型。
+
+## Field-Oriented Improvements / 面向现场的改进
+
+- Summary / 汇总统计：在线主机数、疑似摄像头/NVR、路由器/后台、Windows/NAS、打印机、IoT/UPnP、可打开后台入口数量。
+- Grouped result order / 分组排序：优先显示 Camera/NVR、Router/Admin、Windows/NAS、Printer、IoT/UPnP 等设备线索。
+- Web entry URLs / 后台入口：对常见后台端口自动生成 `http://` 或 `https://` URL，方便复制到浏览器。
+- Combined inference / 组合判断：根据多个端口组合推断“更像路由器”“更像摄像头/NVR”“更像 Windows/NAS”等。
+- HTTP title/server probe / HTTP 标题与 Server 探测：对明文 HTTP 后台发起轻量 `GET /`，读取 `<title>` 和 `Server`。
+- RTSP verification / RTSP 验证：对 `554` 和 `8554` 发送 `OPTIONS * RTSP/1.0`，确认是否真像 RTSP 服务。
+- No pcap dependency / 无 pcap 依赖：不需要 Npcap、WinPcap 或抓包驱动。
 
 ## Detection Coverage / 探测覆盖
 
@@ -55,8 +69,8 @@ https://github.com/ra1nyxin/listlanhost/releases
 
 Assets / 常见资产：
 
-- `listlanhost-0.2.1-windows-x86_64.exe`
-- `listlanhost-0.2.1-linux-x86_64`
+- `listlanhost-0.2.2-windows-x86_64.exe`
+- `listlanhost-0.2.2-linux-x86_64`
 
 ## Usage / 使用
 
@@ -82,13 +96,23 @@ listlanhost --version
 Example / 示例：
 
 ```text
-SCANNING / 正在扫描 254 HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP 850ms, UDP 1200ms, CONCURRENCY / 并发 300)
+SCANNING / 正在扫描 254 HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP 850ms, UDP 1200ms, APP 1200ms, CONCURRENCY / 并发 300)
+
+SUMMARY / 汇总:
+  Online hosts / 在线主机: 3
+  Camera/NVR / 摄像头或录像机: 1
+  Router/Admin / 路由器或后台: 1
+  Windows/NAS / Windows或NAS: 1
+  Printer / 打印机: 0
+  IoT/UPnP / 智能设备: 0
+  Web URLs / 可打开后台入口: 2
+  HTTP/RTSP details / HTTP或RTSP详情: 2
 
 SCAN RESULTS / 扫描结果:
- IP ADDRESS / IP地址   STATUS / 状态   HINTS / 设备线索                 SERVICES / 服务
- 192.168.1.1           ONLINE/在线     Web/Admin 网页后台, DHCP/Router DHCP/路由器   TCP:80(HTTP 后台), UDP:67(DHCP 地址分配)
- 192.168.1.32          ONLINE/在线     Camera/NVR 摄像头/录像机        TCP:554(RTSP 视频流), TCP:8000(HTTP/SDK 摄像头)
- 192.168.1.50          ONLINE/在线     Windows/NAS 共享/NAS            TCP:445(SMB 共享)
+IP ADDRESS / IP地址   STATUS / 状态   GROUP / 分组     HINTS / 设备线索                          SERVICES / 服务                                  URLS / 后台入口             DETAILS / 详情
+192.168.1.32          ONLINE/在线     Camera/NVR      Camera/NVR 摄像头/录像机                   TCP:554(RTSP 视频流), TCP:8000(HTTP/SDK 摄像头)   http://192.168.1.32:8000/  RTSP:554 verified/已确认
+192.168.1.1           ONLINE/在线     Router/Admin    Web/Admin 网页后台, DHCP/Router DHCP/路由器  TCP:80(HTTP 后台), UDP:67(DHCP 地址分配)          http://192.168.1.1/        HTTP:80 Title/标题:Router
+192.168.1.50          ONLINE/在线     Windows/NAS     Windows/NAS 共享/NAS                       TCP:445(SMB 共享)                              -                            -
 ```
 
 ## Build From Source / 从源码构建
@@ -121,12 +145,14 @@ target/release/listlanhost
 - 请只在自己拥有或已获授权的网络中使用。
 - UDP detection is best-effort. No UDP response does not always mean the device is offline.
 - UDP 探测不是强保证；没有 UDP 响应不代表设备一定离线。
+- HTTP title probing only supports plain HTTP. HTTPS URLs are still listed, but title extraction is not attempted without TLS dependencies.
+- HTTP 标题探测只支持明文 HTTP。HTTPS 后台入口仍会列出，但在不引入 TLS 依赖的情况下不会尝试读取标题。
 - Some routers, cameras, NVRs, printers, or firewalls may block probes.
 - 部分路由器、摄像头、录像机、打印机或防火墙可能会拦截探测。
 - A matched port is only a hint, not a final device fingerprint.
 - 端口命中只是设备线索，不等于最终设备指纹。
-- No Npcap or packet capture driver is required.
-- 不需要安装 Npcap 或抓包驱动。
+- No Npcap, WinPcap, or packet capture driver is required.
+- 不需要安装 Npcap、WinPcap 或抓包驱动。
 
 ## License / 许可证
 

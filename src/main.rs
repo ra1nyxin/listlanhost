@@ -6,6 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tabled::{settings::Style, Table, Tabled};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -13,12 +14,17 @@ use tokio::time::timeout;
 const CONCURRENCY_LIMIT: usize = 300;
 const TCP_TIMEOUT: Duration = Duration::from_millis(850);
 const UDP_TIMEOUT: Duration = Duration::from_millis(1200);
+const APP_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Debug)]
 struct HostInfo {
     ip: Ipv4Addr,
+    group: String,
     hints: Vec<String>,
     services: Vec<String>,
+    urls: Vec<String>,
+    details: Vec<String>,
 }
 
 #[derive(Tabled)]
@@ -27,29 +33,40 @@ struct HostRow {
     ip: String,
     #[tabled(rename = "STATUS / 状态")]
     status: String,
+    #[tabled(rename = "GROUP / 分组")]
+    group: String,
     #[tabled(rename = "HINTS / 设备线索")]
     hints: String,
     #[tabled(rename = "SERVICES / 服务")]
     services: String,
+    #[tabled(rename = "URLS / 后台入口")]
+    urls: String,
+    #[tabled(rename = "DETAILS / 详情")]
+    details: String,
 }
 
-impl From<HostInfo> for HostRow {
-    fn from(info: HostInfo) -> Self {
+impl From<&HostInfo> for HostRow {
+    fn from(info: &HostInfo) -> Self {
         Self {
             ip: info.ip.to_string().white().to_string(),
             status: "ONLINE/在线".green().bold().to_string(),
-            hints: info.hints.join(", ").cyan().to_string(),
-            services: info.services.join(", ").dimmed().to_string(),
+            group: info.group.clone().yellow().to_string(),
+            hints: join_or_dash(&info.hints).cyan().to_string(),
+            services: join_or_dash(&info.services).dimmed().to_string(),
+            urls: join_or_dash(&info.urls),
+            details: join_or_dash(&info.details),
         }
     }
 }
 
+#[derive(Clone, Copy)]
 struct TcpProbe {
     port: u16,
     label: &'static str,
     hint: &'static str,
 }
 
+#[derive(Clone, Copy)]
 struct UdpProbe {
     port: u16,
     label: &'static str,
@@ -127,7 +144,6 @@ const UDP_PROBES: &[UdpProbe] = &[
     UdpProbe { port: 3702, label: "WS-Discovery/ONVIF 摄像头", hint: "ONVIF/Camera 摄像头", payload: WS_DISCOVERY_PROBE },
 ];
 
-
 #[tokio::main]
 async fn main() {
     if handle_cli_flag() {
@@ -143,10 +159,11 @@ async fn main() {
         .collect();
 
     println!(
-        "SCANNING / 正在扫描 {} HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP {}ms, UDP {}ms, CONCURRENCY / 并发 {})",
+        "SCANNING / 正在扫描 {} HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP {}ms, UDP {}ms, APP {}ms, CONCURRENCY / 并发 {})",
         hosts.len(),
         TCP_TIMEOUT.as_millis(),
         UDP_TIMEOUT.as_millis(),
+        APP_PROBE_TIMEOUT.as_millis(),
         CONCURRENCY_LIMIT
     );
 
@@ -186,12 +203,86 @@ async fn main() {
         return;
     }
 
-    results.sort_by_key(|host| u32::from(host.ip));
-    let rows: Vec<HostRow> = results.into_iter().map(HostRow::from).collect();
+    results.sort_by_key(|host| (group_priority(&host.group), u32::from(host.ip)));
 
+    print_summary(&results);
+
+    let rows: Vec<HostRow> = results.iter().map(HostRow::from).collect();
     let mut table = Table::new(rows);
     table.with(Style::blank());
     println!("\n{}\n{}", "SCAN RESULTS / 扫描结果:".bold(), table);
+}
+
+async fn check_host(ip: Ipv4Addr) -> Option<HostInfo> {
+    let mut hints = Vec::new();
+    let mut services = Vec::new();
+    let mut tcp_open = Vec::new();
+    let mut udp_open = Vec::new();
+
+    for probe in TCP_PROBES {
+        let addr = SocketAddr::new(IpAddr::V4(ip), probe.port);
+
+        if matches!(timeout(TCP_TIMEOUT, TcpStream::connect(addr)).await, Ok(Ok(_))) {
+            tcp_open.push(probe.port);
+            push_unique(&mut hints, probe.hint.to_string());
+            services.push(format!("TCP:{}({})", probe.port, probe.label));
+        }
+    }
+
+    for probe in UDP_PROBES {
+        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
+            let addr = SocketAddr::new(IpAddr::V4(ip), probe.port);
+            let payload = if probe.port == 67 {
+                dhcp_inform_payload()
+            } else {
+                probe.payload.to_vec()
+            };
+
+            if socket.connect(addr).await.is_err() || socket.send(&payload).await.is_err() {
+                continue;
+            }
+
+            let mut buf = [0u8; 512];
+            if matches!(timeout(UDP_TIMEOUT, socket.recv(&mut buf)).await, Ok(Ok(_))) {
+                udp_open.push(probe.port);
+                push_unique(&mut hints, probe.hint.to_string());
+                services.push(format!("UDP:{}({})", probe.port, probe.label));
+            }
+        }
+    }
+
+    if services.is_empty() {
+        return None;
+    }
+
+    apply_combination_hints(&mut hints, &tcp_open, &udp_open);
+
+    let urls = build_web_urls(ip, &tcp_open);
+    let mut details = Vec::new();
+
+    for port in tcp_open.iter().copied().filter(|port| is_plain_http_probe_port(*port)) {
+        if let Some(info) = probe_http_info(ip, port).await {
+            details.push(format!("HTTP:{port} {info}"));
+        }
+    }
+
+    for port in tcp_open.iter().copied().filter(|port| is_rtsp_port(*port)) {
+        if probe_rtsp(ip, port).await {
+            details.push(format!("RTSP:{port} verified/已确认"));
+            push_unique(&mut hints, "Camera/NVR 摄像头/录像机".to_string());
+        }
+    }
+
+    let group = classify_group(&hints);
+
+    Some(HostInfo {
+        ip,
+        group,
+        hints,
+        services,
+        urls,
+        details,
+    })
 }
 
 fn handle_cli_flag() -> bool {
@@ -232,62 +323,260 @@ fn print_help() {
     println!("  路由器/后台、DHCP、摄像头/录像机、RTSP、ONVIF、NAS、打印机、Windows、智能设备。");
 }
 
-async fn check_host(ip: Ipv4Addr) -> Option<HostInfo> {
-    let mut hints = Vec::new();
-    let mut services = Vec::new();
+fn print_summary(results: &[HostInfo]) {
+    let camera = count_group(results, "Camera/NVR");
+    let router = count_group(results, "Router/Admin");
+    let nas_windows = count_group(results, "Windows/NAS");
+    let printer = count_group(results, "Printer");
+    let iot = count_group(results, "IoT/UPnP");
+    let web_urls = results.iter().filter(|host| !host.urls.is_empty()).count();
+    let app_details = results.iter().filter(|host| !host.details.is_empty()).count();
 
-    for probe in TCP_PROBES {
-        let addr = SocketAddr::new(IpAddr::V4(ip), probe.port);
+    println!();
+    println!("{}", "SUMMARY / 汇总:".bold());
+    println!("  Online hosts / 在线主机: {}", results.len());
+    println!("  Camera/NVR / 摄像头或录像机: {camera}");
+    println!("  Router/Admin / 路由器或后台: {router}");
+    println!("  Windows/NAS / Windows或NAS: {nas_windows}");
+    println!("  Printer / 打印机: {printer}");
+    println!("  IoT/UPnP / 智能设备: {iot}");
+    println!("  Web URLs / 可打开后台入口: {web_urls}");
+    println!("  HTTP/RTSP details / HTTP或RTSP详情: {app_details}");
+}
 
-        if matches!(
-            timeout(TCP_TIMEOUT, TcpStream::connect(addr)).await,
-            Ok(Ok(_))
-        ) {
-            push_unique(&mut hints, probe.hint.to_string());
-            services.push(format!("TCP:{}({})", probe.port, probe.label));
-        }
+fn count_group(results: &[HostInfo], group: &str) -> usize {
+    results.iter().filter(|host| host.group == group).count()
+}
+
+fn apply_combination_hints(hints: &mut Vec<String>, tcp_open: &[u16], udp_open: &[u16]) {
+    if (has_any(tcp_open, &[80, 443, 8080, 8443]) && has_any(tcp_open, &[53]))
+        || udp_open.contains(&67)
+    {
+        push_unique(hints, "Likely Router 路由器可能".to_string());
     }
 
-    for probe in UDP_PROBES {
-        if let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await {
-            let addr = SocketAddr::new(IpAddr::V4(ip), probe.port);
-
-            let payload = if probe.port == 67 {
-                dhcp_inform_payload()
-            } else {
-                probe.payload.to_vec()
-            };
-
-            if socket.connect(addr).await.is_err() || socket.send(&payload).await.is_err() {
-                continue;
-            }
-
-            let mut buf = [0u8; 64];
-
-            if matches!(
-                timeout(UDP_TIMEOUT, socket.recv(&mut buf)).await,
-                Ok(Ok(_))
-            ) {
-                push_unique(&mut hints, probe.hint.to_string());
-                services.push(format!("UDP:{}({})", probe.port, probe.label));
-            }
-        }
+    if has_any(tcp_open, &[554, 8554])
+        && has_any(tcp_open, &[80, 81, 88, 8000, 8081, 8899, 37777, 34567])
+    {
+        push_unique(hints, "Likely Camera/NVR 摄像头或录像机可能".to_string());
     }
 
-    if services.is_empty() {
+    if has_any(tcp_open, &[8000, 8899, 37777, 34567]) || udp_open.contains(&3702) {
+        push_unique(hints, "ONVIF/DVR clue 摄像头协议线索".to_string());
+    }
+
+    if tcp_open.contains(&445) && has_any(tcp_open, &[139, 135]) {
+        push_unique(hints, "Likely Windows/NAS Windows或NAS可能".to_string());
+    }
+
+    if tcp_open.contains(&631) || tcp_open.contains(&5357) {
+        push_unique(hints, "Likely Printer 打印机可能".to_string());
+    }
+
+    if udp_open.contains(&1900) || tcp_open.contains(&2869) {
+        push_unique(hints, "Likely IoT/UPnP 智能设备可能".to_string());
+    }
+}
+
+fn classify_group(hints: &[String]) -> String {
+    if contains_hint(hints, "Camera/NVR") || contains_hint(hints, "ONVIF") {
+        "Camera/NVR".to_string()
+    } else if contains_hint(hints, "Router")
+        || contains_hint(hints, "DHCP")
+        || contains_hint(hints, "Web/Admin")
+    {
+        "Router/Admin".to_string()
+    } else if contains_hint(hints, "Windows/NAS") || contains_hint(hints, "Windows 主机") {
+        "Windows/NAS".to_string()
+    } else if contains_hint(hints, "Printer") {
+        "Printer".to_string()
+    } else if contains_hint(hints, "IoT") || contains_hint(hints, "UPnP") {
+        "IoT/UPnP".to_string()
+    } else if contains_hint(hints, "Game Server") {
+        "Game Server".to_string()
+    } else {
+        "Other/其他".to_string()
+    }
+}
+
+fn group_priority(group: &str) -> u8 {
+    match group {
+        "Camera/NVR" => 0,
+        "Router/Admin" => 1,
+        "Windows/NAS" => 2,
+        "Printer" => 3,
+        "IoT/UPnP" => 4,
+        "Game Server" => 5,
+        _ => 9,
+    }
+}
+
+fn build_web_urls(ip: Ipv4Addr, tcp_open: &[u16]) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    for port in tcp_open.iter().copied().filter(|port| is_web_port(*port)) {
+        let scheme = if is_https_port(port) { "https" } else { "http" };
+        let url = match (scheme, port) {
+            ("http", 80) => format!("http://{ip}/"),
+            ("https", 443) => format!("https://{ip}/"),
+            _ => format!("{scheme}://{ip}:{port}/"),
+        };
+        push_unique(&mut urls, url);
+    }
+
+    urls
+}
+
+async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<String> {
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let mut stream = timeout(APP_PROBE_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+
+    let request = format!("GET / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: listlanhost/{VERSION}\r\n\r\n");
+    timeout(APP_PROBE_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+
+    if n == 0 {
         return None;
     }
 
-    Some(HostInfo {
-        ip,
-        hints,
-        services,
+    let response = String::from_utf8_lossy(&buf[..n]).to_string();
+    extract_http_info(&response)
+}
+
+async fn probe_rtsp(ip: Ipv4Addr, port: u16) -> bool {
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let Ok(Ok(mut stream)) = timeout(APP_PROBE_TIMEOUT, TcpStream::connect(addr)).await else {
+        return false;
+    };
+
+    let request = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    if !matches!(
+        timeout(APP_PROBE_TIMEOUT, stream.write_all(request)).await,
+        Ok(Ok(()))
+    ) {
+        return false;
+    }
+
+    let mut buf = [0u8; 512];
+    let Ok(Ok(n)) = timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf)).await else {
+        return false;
+    };
+
+    String::from_utf8_lossy(&buf[..n]).contains("RTSP/")
+}
+
+fn extract_http_info(response: &str) -> Option<String> {
+    let server = header_value(response, "server").map(|value| format!("Server:{value}"));
+    let title = html_title(response).map(|value| format!("Title/标题:{value}"));
+
+    match (title, server) {
+        (Some(title), Some(server)) => Some(format!("{title}; {server}")),
+        (Some(title), None) => Some(title),
+        (None, Some(server)) => Some(server),
+        (None, None) => None,
+    }
+}
+
+fn header_value(response: &str, header: &str) -> Option<String> {
+    response.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(header) {
+            Some(truncate(clean_text(value), 80))
+        } else {
+            None
+        }
     })
+}
+
+fn html_title(response: &str) -> Option<String> {
+    let lower = response.to_ascii_lowercase();
+    let title_start = lower.find("<title")?;
+    let title_open_end = lower[title_start..].find('>')? + title_start + 1;
+    let title_close = lower[title_open_end..].find("</title>")? + title_open_end;
+    let title = &response[title_open_end..title_close];
+    let title = decode_basic_entities(&clean_text(title));
+
+    if title.is_empty() {
+        None
+    } else {
+        Some(truncate(title, 80))
+    }
+}
+
+fn clean_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_basic_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn truncate(value: String, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn is_web_port(port: u16) -> bool {
+    matches!(
+        port,
+        80 | 81 | 88 | 443 | 5000 | 5001 | 8000 | 8008 | 8080 | 8081 | 8443 | 8888 | 9000 | 9090
+    )
+}
+
+fn is_plain_http_probe_port(port: u16) -> bool {
+    is_web_port(port) && !is_https_port(port)
+}
+
+fn is_https_port(port: u16) -> bool {
+    matches!(port, 443 | 5001 | 8443)
+}
+
+fn is_rtsp_port(port: u16) -> bool {
+    matches!(port, 554 | 8554)
+}
+
+fn has_any(values: &[u16], needles: &[u16]) -> bool {
+    needles.iter().any(|needle| values.contains(needle))
+}
+
+fn contains_hint(hints: &[String], needle: &str) -> bool {
+    hints.iter().any(|hint| hint.contains(needle))
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
     if !values.iter().any(|existing| existing == &value) {
         values.push(value);
+    }
+}
+
+fn join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(", ")
     }
 }
 
