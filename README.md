@@ -1,4 +1,4 @@
-# listlanhost
+<img width="100%" height="100%" alt="image" src="https://github.com/user-attachments/assets/d2de13fb-9d8a-4f42-be5c-9e209ca799c1" />
 
 `listlanhost` (`lslh`) is a lightweight LAN device discovery tool written in Rust.
 
