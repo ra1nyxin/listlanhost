@@ -1,84 +1,90 @@
-<img width="1100" height="269" alt="image" src="https://github.com/user-attachments/assets/441a348a-d2f4-48b2-8c10-884164c91486" />
+# listlanhost
 
-# listlanhost (lslh)
+`listlanhost`（简称 `lslh`）是一个使用 Rust 编写的局域网主机发现工具。它会自动读取当前默认网卡和 IPv4 子网，并发探测网段内的主机，最后以简洁表格输出在线设备。
 
-A high-concurrency LAN host discovery tool written in Rust.
-一款使用 Rust 编写的高并发局域网主机发现工具。
+当前版本：`0.2.0`
 
-## Description / 项目简介
+## 功能
 
-listlanhost (lslh) is a lightweight CLI tool designed for rapid scanning of active devices in a local area network. It uses asynchronous I/O to perform TCP and UDP probing simultaneously, providing a compact and clean output without unnecessary decorations.
+- 自动识别默认网络接口和 IPv4 子网。
+- 使用 Tokio 异步并发扫描，默认并发数为 300。
+- TCP 端口探测：`21`、`22`、`80`、`135`、`445`、`3389`、`8080`、`25565`、`25566`、`60000`。
+- UDP NetBIOS 探测：`137`。
+- 同一主机可聚合显示多个命中的探测方式。
+- 扫描结果按 IP 地址排序，便于快速查看。
+- 输出尽量保持紧凑，适合在终端中直接使用。
 
-listlanhost (lslh) 一款轻量级的命令行工具，专为快速扫描局域网内的活动设备而设计。利用异步 I/O 同时进行 TCP 和 UDP 探测，提供简洁紧凑的输出。
+## 下载
 
-## Features / 功能特性
+每次推送到 `main` 后，GitHub Actions 会自动构建二进制文件，并发布到新的 Release 资产中。Release tag 会自动生成随机值，不需要手动创建或推送 tag。
 
-* High performance asynchronous scanning powered by Tokio.
-  基于 Tokio 实现的高性能异步扫描。
-* Multi-protocol detection: TCP (21, 22, 80, 135, 445, 3389, 25565, 25566) and UDP (NetBIOS).
-  多协议探测：支持 TCP 及 UDP (NetBIOS) 探测。
-* Minimalist output format suitable for terminal integration.
-  极简的输出格式，适合终端集成。
-* Automatic network interface and subnet detection.
-  自动识别网卡及子网掩码。
-* No C-runtime dependencies (pure Rust implementation).
-  无 C 语言运行库依赖（纯 Rust 实现）。
+下载地址：
 
-## Installation / 安装方式
+https://github.com/ra1nyxin/listlanhost/releases
 
-### Binary Download / 下载二进制文件
+常见资产命名类似：
 
-You can download the pre-compiled executable for Windows directly:
-您可以直接下载预编译的 Windows 可执行文件：
+- `listlanhost-0.2.0-windows-x86_64.exe`
+- `listlanhost-0.2.0-linux-x86_64`
+- `listlanhost-0.2.0-macos-x86_64`
 
-[Download listlanhost.exe v1.0.0](https://github.com/ra1nyxin/listlanhost/releases/download/1.0.0/listlanhost.exe)
+## 从源码构建
 
-### From Source / 从源码编译
+需要本机已安装 Rust 工具链。
 
 ```bash
-git clone [https://github.com/ra1nyxin/listlanhost](https://github.com/ra1nyxin/listlanhost)
+git clone https://github.com/ra1nyxin/listlanhost.git
 cd listlanhost
 cargo build --release
-
 ```
 
-To use it globally as `lslh`, move the executable to a directory in your PATH and rename it:
-若想全局使用 `lslh` 命令，请将生成的程序移动至 PATH 目录并重命名：
-
-```powershell
-copy .\target\release\listlanhost.exe $HOME\.cargo\bin\lslh.exe
-
-```
-
-## Usage / 使用方法
-
-Simply run the command in your terminal:
-只需在终端中运行以下命令：
-
-```cmd
-lslh
-
-```
-
-### Example Output / 输出示例
+Windows 下生成：
 
 ```text
-SCANNING RANGE: 192.168.1.105/24 [##############################] 254/254
-
-SCAN RESULTS:
- IP ADDRESS      STATUS   METHOD 
- 192.168.1.1     ONLINE   TCP:80 
- 192.168.1.102   ONLINE   TCP:3389 
- 192.168.1.105   ONLINE   UDP:137
-
+target\release\listlanhost.exe
 ```
 
-## License / 许可协议
+Linux/macOS 下生成：
 
-This project is licensed under the MIT License.
-本项目采用 MIT 许可协议。
+```text
+target/release/listlanhost
+```
 
----
+如果想以 `lslh` 命令使用，可以把构建出的可执行文件复制到 PATH 中的目录，并重命名为 `lslh` 或 `lslh.exe`。
 
-Copyright (c) 2025 ra1nyxin
-qwq
+## 使用
+
+直接运行：
+
+```bash
+listlanhost
+```
+
+如果你把程序重命名为 `lslh`：
+
+```bash
+lslh
+```
+
+示例输出：
+
+```text
+SCANNING 254 HOSTS (TIMEOUT 3s, CONCURRENCY 300)
+
+SCAN RESULTS:
+ IP ADDRESS      STATUS   METHODS
+ 192.168.1.1     ONLINE   TCP:80, TCP:445
+ 192.168.1.23    ONLINE   UDP:137
+ 192.168.1.105   ONLINE   TCP:25565
+```
+
+## 注意
+
+- 这个工具会对当前局域网网段发起 TCP/UDP 探测，请只在你有权限的网络环境中使用。
+- Windows 防火墙、路由器策略、设备休眠状态都可能影响扫描结果。
+- UDP 探测不是强保证；没有 UDP 响应不代表主机一定离线。
+- 当前版本不需要安装 Npcap，也不依赖 C 运行库。
+
+## License
+
+MIT

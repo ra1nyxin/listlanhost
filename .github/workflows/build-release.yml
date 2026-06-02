@@ -1,0 +1,78 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: listlanhost-0.2.0-windows-x86_64.exe
+            binary: target/release/listlanhost.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: listlanhost-0.2.0-linux-x86_64
+            binary: target/release/listlanhost
+          - name: macos-x86_64
+            os: macos-13
+            artifact: listlanhost-0.2.0-macos-x86_64
+            binary: target/release/listlanhost
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Rename binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item -LiteralPath "${{ matrix.binary }}" -Destination "dist/${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create random release tag
+        id: tag
+        run: |
+          echo "tag=auto-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: listlanhost 0.2.0 (${{ steps.tag.outputs.tag }})
+          body: |
+            listlanhost 0.2.0 自动构建产物。
+
+            本 Release 由 GitHub Actions 在 push 到 main 后自动创建。
+          files: dist/*
