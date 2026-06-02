@@ -21,11 +21,11 @@ jobs:
         include:
           - name: windows-x86_64
             os: windows-latest
-            artifact: listlanhost-0.2.2-windows-x86_64.exe
+            artifact: listlanhost-0.2.3-windows-x86_64.exe
             binary: target/release/listlanhost.exe
           - name: linux-x86_64
             os: ubuntu-latest
-            artifact: listlanhost-0.2.2-linux-x86_64
+            artifact: listlanhost-0.2.3-linux-x86_64
             binary: target/release/listlanhost
 
     steps:
@@ -69,9 +69,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: listlanhost 0.2.2 (${{ steps.tag.outputs.tag }})
+          name: listlanhost 0.2.3 (${{ steps.tag.outputs.tag }})
           body: |
-            listlanhost 0.2.2 自动构建产物。
+            listlanhost 0.2.3 自动构建产物。
 
             本 Release 由 GitHub Actions 在 push 到 main 后自动创建。
           files: dist/*

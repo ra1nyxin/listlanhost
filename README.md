@@ -4,33 +4,37 @@
 
 `listlanhost`（简称 `lslh`）是一个使用 Rust 编写的轻量级局域网设备发现工具，适合弱电施工、机房巡检、家庭/办公室网络排查、临时接入设备摸排等场景。
 
-Current version / 当前版本：`0.2.2`
+Current version / 当前版本：`0.2.3`
 
 ## What It Does / 它能做什么
 
-The tool automatically reads the default network interface, calculates the local IPv4 subnet, scans active hosts concurrently, and prints a bilingual summary and result table.
+The tool automatically reads the default network interface, calculates the local IPv4 subnet, scans active hosts concurrently, and prints a bilingual field-friendly result.
 
-它会自动读取默认网卡和本机 IPv4 子网，并发扫描网段内的在线主机，最后输出中英双语汇总和结果表。
+它会自动读取默认网卡和本机 IPv4 子网，并发扫描网段内的在线主机，然后输出中英双语、适合现场查看的结果。
 
-The output includes device groups, service hints, web entry URLs, HTTP title/server details, and RTSP verification when available.
+The output includes summary counters, grouped host cards, device hints, web entry URLs, HTTP status/title/server details, RTSP status/auth details, vendor fingerprints, default gateway marking, and automatic report files.
 
-输出会给出设备分组、服务线索、后台入口 URL、HTTP 标题/Server 信息，以及可用时的 RTSP 验证结果，方便现场人员快速判断设备类型。
+输出包含汇总统计、按设备类型分组的主机卡片、设备线索、后台入口 URL、HTTP 状态码/标题/Server、RTSP 状态/认证详情、厂商指纹、默认网关标记，并自动生成报告文件。
 
 ## Field-Oriented Improvements / 面向现场的改进
 
-- Summary / 汇总统计：在线主机数、疑似摄像头/NVR、路由器/后台、Windows/NAS、打印机、IoT/UPnP、可打开后台入口数量。
-- Grouped result order / 分组排序：优先显示 Camera/NVR、Router/Admin、Windows/NAS、Printer、IoT/UPnP 等设备线索。
+- Summary / 汇总统计：在线主机数、默认网关、疑似摄像头/NVR、路由器/后台、普通后台页面、Windows/NAS、打印机、IoT/UPnP、后台 URL、HTTP/RTSP 详情、指纹线索。
+- Grouped card layout / 分组卡片布局：不再用一张很宽的表格，而是按 Camera/NVR、Router/Admin、Web/Admin、Windows/NAS 等分组输出，终端更容易看。
+- Report files / 自动报告：每次扫描后自动生成 `txt`、`csv`、`json` 三份报告，方便留档、发客户或导入表格。
 - Web entry URLs / 后台入口：对常见后台端口自动生成 `http://` 或 `https://` URL，方便复制到浏览器。
-- Combined inference / 组合判断：根据多个端口组合推断“更像路由器”“更像摄像头/NVR”“更像 Windows/NAS”等。
-- HTTP title/server probe / HTTP 标题与 Server 探测：对明文 HTTP 后台发起轻量 `GET /`，读取 `<title>` 和 `Server`。
-- RTSP verification / RTSP 验证：对 `554` 和 `8554` 发送 `OPTIONS * RTSP/1.0`，确认是否真像 RTSP 服务。
+- Combined inference / 组合判断：根据多个端口组合推断“更像路由器”“更像摄像头/NVR”“更像 Windows/NAS”“更像打印机”等。
+- HTTP status/title/server probe / HTTP 状态、标题与 Server 探测：对明文 HTTP 后台发起轻量 `GET /`，读取状态码、`<title>` 和 `Server`。
+- RTSP status/auth probe / RTSP 状态与认证探测：对 `554` 和 `8554` 发送 `OPTIONS * RTSP/1.0`，读取状态码、`Server` 和认证提示。
+- Default gateway marking / 默认网关标记：如果系统能读取默认网关，会单独标记 `DEFAULT GATEWAY / 默认网关`。
+- Vendor/device fingerprinting / 厂商与设备指纹：基于标题、Server、RTSP 响应等识别 Hikvision、Dahua、TP-LINK、OpenWrt、Synology、QNAP、nginx、IIS 等线索。
+- Fewer false positives / 减少误报：单独命中普通 HTTP 后台不会直接归类成路由器；需要默认网关、DHCP、DNS+后台等组合线索才更偏 Router/Admin。
 - No pcap dependency / 无 pcap 依赖：不需要 Npcap、WinPcap 或抓包驱动。
 
 ## Detection Coverage / 探测覆盖
 
-`listlanhost` does not try to log in to any device. It only checks whether common service ports respond.
+`listlanhost` does not try to log in to any device. It only checks whether common service ports respond and reads lightweight banners when possible.
 
-`listlanhost` 不会尝试登录任何设备，只做常见服务端口探测。
+`listlanhost` 不会尝试登录任何设备，只做常见服务端口探测，并在可行时读取轻量级 banner/标题信息。
 
 ### Network Infrastructure / 网络基础设施
 
@@ -69,8 +73,8 @@ https://github.com/ra1nyxin/listlanhost/releases
 
 Assets / 常见资产：
 
-- `listlanhost-0.2.2-windows-x86_64.exe`
-- `listlanhost-0.2.2-linux-x86_64`
+- `listlanhost-0.2.3-windows-x86_64.exe`
+- `listlanhost-0.2.3-linux-x86_64`
 
 ## Usage / 使用
 
@@ -96,24 +100,55 @@ listlanhost --version
 Example / 示例：
 
 ```text
-SCANNING / 正在扫描 254 HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP 850ms, UDP 1200ms, APP 1200ms, CONCURRENCY / 并发 300)
+SCANNING / 正在扫描 254 HOSTS / 主机 (192.168.1.20 / 24, TCP 850ms, UDP 1200ms, APP 1200ms, CONCURRENCY / 并发 300)
+DEFAULT GATEWAY / 默认网关: 192.168.1.1
 
 SUMMARY / 汇总:
   Online hosts / 在线主机: 3
+  Default gateway / 默认网关: 1
   Camera/NVR / 摄像头或录像机: 1
   Router/Admin / 路由器或后台: 1
+  Web/Admin only / 普通后台页面: 0
   Windows/NAS / Windows或NAS: 1
   Printer / 打印机: 0
   IoT/UPnP / 智能设备: 0
   Web URLs / 可打开后台入口: 2
-  HTTP/RTSP details / HTTP或RTSP详情: 2
+  HTTP details / HTTP详情: 1
+  RTSP details / RTSP详情: 1
+  Fingerprints / 指纹线索: 2
 
 SCAN RESULTS / 扫描结果:
-IP ADDRESS / IP地址   STATUS / 状态   GROUP / 分组     HINTS / 设备线索                          SERVICES / 服务                                  URLS / 后台入口             DETAILS / 详情
-192.168.1.32          ONLINE/在线     Camera/NVR      Camera/NVR 摄像头/录像机                   TCP:554(RTSP 视频流), TCP:8000(HTTP/SDK 摄像头)   http://192.168.1.32:8000/  RTSP:554 verified/已确认
-192.168.1.1           ONLINE/在线     Router/Admin    Web/Admin 网页后台, DHCP/Router DHCP/路由器  TCP:80(HTTP 后台), UDP:67(DHCP 地址分配)          http://192.168.1.1/        HTTP:80 Title/标题:Router
-192.168.1.50          ONLINE/在线     Windows/NAS     Windows/NAS 共享/NAS                       TCP:445(SMB 共享)                              -                            -
+
+[Camera/NVR] 1 host(s)
+192.168.1.32 ONLINE/在线
+  Hints / 线索: Camera/NVR 摄像头/录像机 | Likely Camera/NVR 摄像头或录像机可能
+  Services / 服务: TCP:554(RTSP 视频流) | TCP:8000(HTTP/SDK 摄像头)
+  URLs / 后台入口: http://192.168.1.32:8000/
+  Fingerprints / 指纹: Hikvision 海康威视
+  RTSP / 视频流详情: RTSP:554 HTTP/RTSP 401; Server:Embedded RTSP; Auth required/需要认证
+
+[Router/Admin] 1 host(s)
+192.168.1.1 ONLINE/在线  DEFAULT GATEWAY / 默认网关
+  Hints / 线索: Default Gateway 默认网关 | Likely Router 路由器可能
+  Services / 服务: SYSTEM:default-gateway(默认网关) | TCP:80(HTTP 后台)
+  URLs / 后台入口: http://192.168.1.1/
+  HTTP / 网页详情: http://192.168.1.1/ HTTP/RTSP 200; Title/标题:Router; Fingerprint/指纹:TP-LINK 路由器
+
+REPORTS / 报告文件:
+  listlanhost-report-1780000000.txt
+  listlanhost-report-1780000000.csv
+  listlanhost-report-1780000000.json
 ```
+
+## Report Files / 报告文件
+
+The reports are written to the current working directory.
+
+报告会写入当前工作目录。
+
+- `.txt`: human-readable field report / 适合直接查看的现场报告
+- `.csv`: spreadsheet-friendly report / 适合导入 Excel 或表格工具
+- `.json`: structured data for scripts / 适合脚本或后续自动化处理
 
 ## Build From Source / 从源码构建
 
@@ -147,6 +182,8 @@ target/release/listlanhost
 - UDP 探测不是强保证；没有 UDP 响应不代表设备一定离线。
 - HTTP title probing only supports plain HTTP. HTTPS URLs are still listed, but title extraction is not attempted without TLS dependencies.
 - HTTP 标题探测只支持明文 HTTP。HTTPS 后台入口仍会列出，但在不引入 TLS 依赖的情况下不会尝试读取标题。
+- Vendor fingerprinting is a hint based on banners and titles, not a final identification.
+- 厂商指纹只是根据 banner 和标题推断的线索，不是最终设备鉴定。
 - Some routers, cameras, NVRs, printers, or firewalls may block probes.
 - 部分路由器、摄像头、录像机、打印机或防火墙可能会拦截探测。
 - A matched port is only a hint, not a final device fingerprint.

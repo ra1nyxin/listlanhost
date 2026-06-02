@@ -2,10 +2,11 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use ipnetwork::Ipv4Network;
 use std::env;
+use std::fs::File;
+use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
-use tabled::{settings::Style, Table, Tabled};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
@@ -18,45 +19,45 @@ const APP_PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
+struct NetworkContext {
+    interface_name: String,
+    local_ip: Ipv4Addr,
+    prefix_len: u8,
+    host_count: usize,
+    default_gateway: Option<Ipv4Addr>,
+}
+
+#[derive(Debug)]
 struct HostInfo {
     ip: Ipv4Addr,
     group: String,
+    is_default_gateway: bool,
     hints: Vec<String>,
     services: Vec<String>,
     urls: Vec<String>,
-    details: Vec<String>,
+    http: Vec<HttpProbeInfo>,
+    rtsp: Vec<RtspProbeInfo>,
+    fingerprints: Vec<String>,
 }
 
-#[derive(Tabled)]
-struct HostRow {
-    #[tabled(rename = "IP ADDRESS / IP地址")]
-    ip: String,
-    #[tabled(rename = "STATUS / 状态")]
-    status: String,
-    #[tabled(rename = "GROUP / 分组")]
-    group: String,
-    #[tabled(rename = "HINTS / 设备线索")]
-    hints: String,
-    #[tabled(rename = "SERVICES / 服务")]
-    services: String,
-    #[tabled(rename = "URLS / 后台入口")]
-    urls: String,
-    #[tabled(rename = "DETAILS / 详情")]
-    details: String,
+#[derive(Debug)]
+struct HttpProbeInfo {
+    port: u16,
+    url: String,
+    status_code: Option<u16>,
+    title: Option<String>,
+    server: Option<String>,
+    auth_required: bool,
+    fingerprints: Vec<String>,
 }
 
-impl From<&HostInfo> for HostRow {
-    fn from(info: &HostInfo) -> Self {
-        Self {
-            ip: info.ip.to_string().white().to_string(),
-            status: "ONLINE/在线".green().bold().to_string(),
-            group: info.group.clone().yellow().to_string(),
-            hints: join_or_dash(&info.hints).cyan().to_string(),
-            services: join_or_dash(&info.services).dimmed().to_string(),
-            urls: join_or_dash(&info.urls),
-            details: join_or_dash(&info.details),
-        }
-    }
+#[derive(Debug)]
+struct RtspProbeInfo {
+    port: u16,
+    status_code: Option<u16>,
+    server: Option<String>,
+    auth_required: bool,
+    fingerprints: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -153,21 +154,38 @@ async fn main() {
     let interface = default_net::get_default_interface().expect("INTERFACE ERROR");
     let ipv4 = interface.ipv4.first().expect("IPV4 ERROR");
     let network = Ipv4Network::new(ipv4.addr, ipv4.prefix_len).expect("NETWORK ERROR");
+    let default_gateway = interface.gateway.as_ref().and_then(|gateway| match gateway.ip_addr {
+        IpAddr::V4(ip) => Some(ip),
+        IpAddr::V6(_) => None,
+    });
     let hosts: Vec<Ipv4Addr> = network
         .iter()
         .filter(|ip| *ip != network.network() && *ip != network.broadcast())
         .collect();
 
+    let context = NetworkContext {
+        interface_name: interface.name.clone(),
+        local_ip: ipv4.addr,
+        prefix_len: ipv4.prefix_len,
+        host_count: hosts.len(),
+        default_gateway,
+    };
+
     println!(
-        "SCANNING / 正在扫描 {} HOSTS / 主机 (LAN DEVICE DISCOVERY / 局域网设备发现, TCP {}ms, UDP {}ms, APP {}ms, CONCURRENCY / 并发 {})",
-        hosts.len(),
+        "SCANNING / 正在扫描 {} HOSTS / 主机 ({} / {}, TCP {}ms, UDP {}ms, APP {}ms, CONCURRENCY / 并发 {})",
+        context.host_count,
+        context.local_ip,
+        context.prefix_len,
         TCP_TIMEOUT.as_millis(),
         UDP_TIMEOUT.as_millis(),
         APP_PROBE_TIMEOUT.as_millis(),
         CONCURRENCY_LIMIT
     );
+    if let Some(gateway) = context.default_gateway {
+        println!("DEFAULT GATEWAY / 默认网关: {gateway}");
+    }
 
-    let pb = ProgressBar::new(hosts.len() as u64);
+    let pb = ProgressBar::new(context.host_count as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:30.white/black} {pos}/{len}")
@@ -180,10 +198,11 @@ async fn main() {
     for target_ip in hosts {
         let sem = Arc::clone(&semaphore);
         let pb_clone = pb.clone();
+        let default_gateway = context.default_gateway;
 
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
-            let result = check_host(target_ip).await;
+            let result = check_host(target_ip, default_gateway).await;
             pb_clone.inc(1);
             result
         }));
@@ -206,18 +225,32 @@ async fn main() {
     results.sort_by_key(|host| (group_priority(&host.group), u32::from(host.ip)));
 
     print_summary(&results);
+    print_grouped_results(&results);
 
-    let rows: Vec<HostRow> = results.iter().map(HostRow::from).collect();
-    let mut table = Table::new(rows);
-    table.with(Style::blank());
-    println!("\n{}\n{}", "SCAN RESULTS / 扫描结果:".bold(), table);
+    match write_reports(&context, &results) {
+        Ok(paths) => {
+            println!();
+            println!("{}", "REPORTS / 报告文件:".bold());
+            for path in paths {
+                println!("  {path}");
+            }
+        }
+        Err(err) => eprintln!("REPORT ERROR / 报告写入失败: {err}"),
+    }
 }
 
-async fn check_host(ip: Ipv4Addr) -> Option<HostInfo> {
+async fn check_host(ip: Ipv4Addr, default_gateway: Option<Ipv4Addr>) -> Option<HostInfo> {
+    let is_default_gateway = default_gateway == Some(ip);
     let mut hints = Vec::new();
     let mut services = Vec::new();
     let mut tcp_open = Vec::new();
     let mut udp_open = Vec::new();
+
+    if is_default_gateway {
+        push_unique(&mut hints, "Default Gateway 默认网关".to_string());
+        push_unique(&mut hints, "Likely Router 路由器可能".to_string());
+        services.push("SYSTEM:default-gateway(默认网关)".to_string());
+    }
 
     for probe in TCP_PROBES {
         let addr = SocketAddr::new(IpAddr::V4(ip), probe.port);
@@ -258,30 +291,42 @@ async fn check_host(ip: Ipv4Addr) -> Option<HostInfo> {
     apply_combination_hints(&mut hints, &tcp_open, &udp_open);
 
     let urls = build_web_urls(ip, &tcp_open);
-    let mut details = Vec::new();
+    let mut http = Vec::new();
+    let mut rtsp = Vec::new();
+    let mut fingerprints = Vec::new();
 
     for port in tcp_open.iter().copied().filter(|port| is_plain_http_probe_port(*port)) {
         if let Some(info) = probe_http_info(ip, port).await {
-            details.push(format!("HTTP:{port} {info}"));
+            for fingerprint in &info.fingerprints {
+                push_unique(&mut fingerprints, fingerprint.clone());
+            }
+            http.push(info);
         }
     }
 
     for port in tcp_open.iter().copied().filter(|port| is_rtsp_port(*port)) {
-        if probe_rtsp(ip, port).await {
-            details.push(format!("RTSP:{port} verified/已确认"));
+        if let Some(info) = probe_rtsp(ip, port).await {
             push_unique(&mut hints, "Camera/NVR 摄像头/录像机".to_string());
+            for fingerprint in &info.fingerprints {
+                push_unique(&mut fingerprints, fingerprint.clone());
+            }
+            rtsp.push(info);
         }
     }
 
-    let group = classify_group(&hints);
+    apply_fingerprint_hints(&mut hints, &fingerprints);
+    let group = classify_group(&hints, &fingerprints);
 
     Some(HostInfo {
         ip,
         group,
+        is_default_gateway,
         hints,
         services,
         urls,
-        details,
+        http,
+        rtsp,
+        fingerprints,
     })
 }
 
@@ -318,30 +363,79 @@ fn print_help() {
     println!("  Fast LAN device discovery for field work.");
     println!("  面向弱电施工、机房巡检、办公室/家庭网络排查的局域网设备发现。");
     println!();
-    println!("Hints / 线索:");
-    println!("  Router/Admin, DHCP, Camera/NVR, RTSP, ONVIF, NAS, Printer, Windows, IoT.");
-    println!("  路由器/后台、DHCP、摄像头/录像机、RTSP、ONVIF、NAS、打印机、Windows、智能设备。");
+    println!("Output / 输出:");
+    println!("  Summary, grouped results, web URLs, HTTP title/server, RTSP details, reports.");
+    println!("  汇总、分组结果、后台入口、HTTP 标题/Server、RTSP 详情、报告文件。");
 }
 
 fn print_summary(results: &[HostInfo]) {
     let camera = count_group(results, "Camera/NVR");
     let router = count_group(results, "Router/Admin");
+    let web_admin = count_group(results, "Web/Admin");
     let nas_windows = count_group(results, "Windows/NAS");
     let printer = count_group(results, "Printer");
     let iot = count_group(results, "IoT/UPnP");
+    let gateway = results.iter().filter(|host| host.is_default_gateway).count();
     let web_urls = results.iter().filter(|host| !host.urls.is_empty()).count();
-    let app_details = results.iter().filter(|host| !host.details.is_empty()).count();
+    let http_details = results.iter().filter(|host| !host.http.is_empty()).count();
+    let rtsp_details = results.iter().filter(|host| !host.rtsp.is_empty()).count();
+    let fingerprints = results.iter().filter(|host| !host.fingerprints.is_empty()).count();
 
     println!();
     println!("{}", "SUMMARY / 汇总:".bold());
     println!("  Online hosts / 在线主机: {}", results.len());
+    println!("  Default gateway / 默认网关: {gateway}");
     println!("  Camera/NVR / 摄像头或录像机: {camera}");
     println!("  Router/Admin / 路由器或后台: {router}");
+    println!("  Web/Admin only / 普通后台页面: {web_admin}");
     println!("  Windows/NAS / Windows或NAS: {nas_windows}");
     println!("  Printer / 打印机: {printer}");
     println!("  IoT/UPnP / 智能设备: {iot}");
     println!("  Web URLs / 可打开后台入口: {web_urls}");
-    println!("  HTTP/RTSP details / HTTP或RTSP详情: {app_details}");
+    println!("  HTTP details / HTTP详情: {http_details}");
+    println!("  RTSP details / RTSP详情: {rtsp_details}");
+    println!("  Fingerprints / 指纹线索: {fingerprints}");
+}
+
+fn print_grouped_results(results: &[HostInfo]) {
+    println!();
+    println!("{}", "SCAN RESULTS / 扫描结果:".bold());
+
+    let mut current_group = "";
+    for host in results {
+        if host.group != current_group {
+            current_group = &host.group;
+            let count = count_group(results, current_group);
+            println!();
+            println!("{} {}", format!("[{current_group}]").bold().yellow(), format!("{count} host(s)").dimmed());
+        }
+
+        let gateway_mark = if host.is_default_gateway {
+            "  DEFAULT GATEWAY / 默认网关".green().bold().to_string()
+        } else {
+            String::new()
+        };
+
+        println!("{} {}{}", host.ip.to_string().white().bold(), "ONLINE/在线".green().bold(), gateway_mark);
+        print_field("Hints / 线索", &host.hints);
+        print_field("Services / 服务", &host.services);
+        print_field("URLs / 后台入口", &host.urls);
+        print_field("Fingerprints / 指纹", &host.fingerprints);
+
+        let http_lines: Vec<String> = host.http.iter().map(HttpProbeInfo::display_line).collect();
+        print_field("HTTP / 网页详情", &http_lines);
+
+        let rtsp_lines: Vec<String> = host.rtsp.iter().map(RtspProbeInfo::display_line).collect();
+        print_field("RTSP / 视频流详情", &rtsp_lines);
+    }
+}
+
+fn print_field(label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+
+    println!("  {label}: {}", values.join(" | "));
 }
 
 fn count_group(results: &[HostInfo], group: &str) -> usize {
@@ -349,7 +443,7 @@ fn count_group(results: &[HostInfo], group: &str) -> usize {
 }
 
 fn apply_combination_hints(hints: &mut Vec<String>, tcp_open: &[u16], udp_open: &[u16]) {
-    if (has_any(tcp_open, &[80, 443, 8080, 8443]) && has_any(tcp_open, &[53]))
+    if (has_any(tcp_open, &[80, 443, 8080, 8443]) && tcp_open.contains(&53))
         || udp_open.contains(&67)
     {
         push_unique(hints, "Likely Router 路由器可能".to_string());
@@ -378,14 +472,26 @@ fn apply_combination_hints(hints: &mut Vec<String>, tcp_open: &[u16], udp_open: 
     }
 }
 
-fn classify_group(hints: &[String]) -> String {
-    if contains_hint(hints, "Camera/NVR") || contains_hint(hints, "ONVIF") {
-        "Camera/NVR".to_string()
-    } else if contains_hint(hints, "Router")
-        || contains_hint(hints, "DHCP")
-        || contains_hint(hints, "Web/Admin")
-    {
+fn apply_fingerprint_hints(hints: &mut Vec<String>, fingerprints: &[String]) {
+    for fingerprint in fingerprints {
+        let lower = fingerprint.to_ascii_lowercase();
+        if contains_any(&lower, &["hikvision", "dahua", "uniview", "camera", "nvr", "dvr"]) {
+            push_unique(hints, "Fingerprint Camera/NVR 指纹指向摄像头/录像机".to_string());
+        } else if contains_any(&lower, &["tp-link", "openwrt", "mikrotik", "huawei", "router"]) {
+            push_unique(hints, "Fingerprint Router 指纹指向路由器".to_string());
+        } else if contains_any(&lower, &["synology", "qnap"]) {
+            push_unique(hints, "Fingerprint NAS 指纹指向NAS".to_string());
+        }
+    }
+}
+
+fn classify_group(hints: &[String], fingerprints: &[String]) -> String {
+    if contains_hint(hints, "Default Gateway") || contains_hint(hints, "Likely Router") {
         "Router/Admin".to_string()
+    } else if contains_hint(hints, "Camera/NVR") || contains_hint(hints, "ONVIF") {
+        "Camera/NVR".to_string()
+    } else if fingerprints.iter().any(|value| contains_any(&value.to_ascii_lowercase(), &["hikvision", "dahua", "uniview"])) {
+        "Camera/NVR".to_string()
     } else if contains_hint(hints, "Windows/NAS") || contains_hint(hints, "Windows 主机") {
         "Windows/NAS".to_string()
     } else if contains_hint(hints, "Printer") {
@@ -394,6 +500,8 @@ fn classify_group(hints: &[String]) -> String {
         "IoT/UPnP".to_string()
     } else if contains_hint(hints, "Game Server") {
         "Game Server".to_string()
+    } else if contains_hint(hints, "Web/Admin") || contains_hint(hints, "Admin") {
+        "Web/Admin".to_string()
     } else {
         "Other/其他".to_string()
     }
@@ -403,10 +511,11 @@ fn group_priority(group: &str) -> u8 {
     match group {
         "Camera/NVR" => 0,
         "Router/Admin" => 1,
-        "Windows/NAS" => 2,
-        "Printer" => 3,
-        "IoT/UPnP" => 4,
-        "Game Server" => 5,
+        "Web/Admin" => 2,
+        "Windows/NAS" => 3,
+        "Printer" => 4,
+        "IoT/UPnP" => 5,
+        "Game Server" => 6,
         _ => 9,
     }
 }
@@ -415,19 +524,22 @@ fn build_web_urls(ip: Ipv4Addr, tcp_open: &[u16]) -> Vec<String> {
     let mut urls = Vec::new();
 
     for port in tcp_open.iter().copied().filter(|port| is_web_port(*port)) {
-        let scheme = if is_https_port(port) { "https" } else { "http" };
-        let url = match (scheme, port) {
-            ("http", 80) => format!("http://{ip}/"),
-            ("https", 443) => format!("https://{ip}/"),
-            _ => format!("{scheme}://{ip}:{port}/"),
-        };
-        push_unique(&mut urls, url);
+        push_unique(&mut urls, web_url(ip, port));
     }
 
     urls
 }
 
-async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<String> {
+fn web_url(ip: Ipv4Addr, port: u16) -> String {
+    let scheme = if is_https_port(port) { "https" } else { "http" };
+    match (scheme, port) {
+        ("http", 80) => format!("http://{ip}/"),
+        ("https", 443) => format!("https://{ip}/"),
+        _ => format!("{scheme}://{ip}:{port}/"),
+    }
+}
+
+async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<HttpProbeInfo> {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let mut stream = timeout(APP_PROBE_TIMEOUT, TcpStream::connect(addr))
         .await
@@ -440,7 +552,7 @@ async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<String> {
         .ok()?
         .ok()?;
 
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 8192];
     let n = timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf))
         .await
         .ok()?
@@ -451,40 +563,119 @@ async fn probe_http_info(ip: Ipv4Addr, port: u16) -> Option<String> {
     }
 
     let response = String::from_utf8_lossy(&buf[..n]).to_string();
-    extract_http_info(&response)
+    let status_code = http_status_code(&response);
+    let title = html_title(&response);
+    let server = header_value(&response, "server");
+    let auth_required = matches!(status_code, Some(401 | 403));
+    let fingerprints = detect_fingerprints(&response);
+
+    Some(HttpProbeInfo {
+        port,
+        url: web_url(ip, port),
+        status_code,
+        title,
+        server,
+        auth_required,
+        fingerprints,
+    })
 }
 
-async fn probe_rtsp(ip: Ipv4Addr, port: u16) -> bool {
+async fn probe_rtsp(ip: Ipv4Addr, port: u16) -> Option<RtspProbeInfo> {
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let Ok(Ok(mut stream)) = timeout(APP_PROBE_TIMEOUT, TcpStream::connect(addr)).await else {
-        return false;
+        return None;
     };
 
-    let request = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+    let request = b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: listlanhost\r\n\r\n";
     if !matches!(
         timeout(APP_PROBE_TIMEOUT, stream.write_all(request)).await,
         Ok(Ok(()))
     ) {
-        return false;
+        return None;
     }
 
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 2048];
     let Ok(Ok(n)) = timeout(APP_PROBE_TIMEOUT, stream.read(&mut buf)).await else {
-        return false;
+        return None;
     };
 
-    String::from_utf8_lossy(&buf[..n]).contains("RTSP/")
+    let response = String::from_utf8_lossy(&buf[..n]).to_string();
+    if !response.contains("RTSP/") {
+        return None;
+    }
+
+    let status_code = rtsp_status_code(&response);
+    let server = header_value(&response, "server");
+    let auth_required = response.to_ascii_lowercase().contains("www-authenticate")
+        || matches!(status_code, Some(401 | 403));
+    let fingerprints = detect_fingerprints(&response);
+
+    Some(RtspProbeInfo {
+        port,
+        status_code,
+        server,
+        auth_required,
+        fingerprints,
+    })
 }
 
-fn extract_http_info(response: &str) -> Option<String> {
-    let server = header_value(response, "server").map(|value| format!("Server:{value}"));
-    let title = html_title(response).map(|value| format!("Title/标题:{value}"));
+impl HttpProbeInfo {
+    fn display_line(&self) -> String {
+        let mut parts = vec![format!("{} {}", self.url, status_text(self.status_code))];
 
-    match (title, server) {
-        (Some(title), Some(server)) => Some(format!("{title}; {server}")),
-        (Some(title), None) => Some(title),
-        (None, Some(server)) => Some(server),
-        (None, None) => None,
+        if let Some(title) = &self.title {
+            parts.push(format!("Title/标题:{title}"));
+        }
+        if let Some(server) = &self.server {
+            parts.push(format!("Server:{server}"));
+        }
+        if self.auth_required {
+            parts.push("Auth required/需要认证".to_string());
+        }
+        if !self.fingerprints.is_empty() {
+            parts.push(format!("Fingerprint/指纹:{}", self.fingerprints.join(", ")));
+        }
+
+        parts.join("; ")
+    }
+}
+
+impl RtspProbeInfo {
+    fn display_line(&self) -> String {
+        let mut parts = vec![format!("RTSP:{} {}", self.port, status_text(self.status_code))];
+
+        if let Some(server) = &self.server {
+            parts.push(format!("Server:{server}"));
+        }
+        if self.auth_required {
+            parts.push("Auth required/需要认证".to_string());
+        }
+        if !self.fingerprints.is_empty() {
+            parts.push(format!("Fingerprint/指纹:{}", self.fingerprints.join(", ")));
+        }
+
+        parts.join("; ")
+    }
+}
+
+fn http_status_code(response: &str) -> Option<u16> {
+    let first_line = response.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let _http = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+fn rtsp_status_code(response: &str) -> Option<u16> {
+    let first_line = response.lines().next()?;
+    let mut parts = first_line.split_whitespace();
+    let _rtsp = parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+fn status_text(status_code: Option<u16>) -> String {
+    match status_code {
+        Some(code) => format!("HTTP/RTSP {code}"),
+        None => "status unknown/状态未知".to_string(),
     }
 }
 
@@ -514,6 +705,43 @@ fn html_title(response: &str) -> Option<String> {
     }
 }
 
+fn detect_fingerprints(response: &str) -> Vec<String> {
+    let lower = response.to_ascii_lowercase();
+    let mut fingerprints = Vec::new();
+
+    let rules = [
+        ("hikvision", "Hikvision 海康威视"),
+        ("webs", "Hikvision/Embedded Webs 海康/嵌入式Web"),
+        ("dahua", "Dahua 大华"),
+        ("uniview", "Uniview 宇视"),
+        ("tp-link", "TP-LINK 路由器"),
+        ("tplink", "TP-LINK 路由器"),
+        ("openwrt", "OpenWrt 路由器"),
+        ("luci", "OpenWrt LuCI"),
+        ("mikrotik", "MikroTik 路由器"),
+        ("huawei", "Huawei 华为设备"),
+        ("synology", "Synology 群晖 NAS"),
+        ("diskstation", "Synology 群晖 NAS"),
+        ("qnap", "QNAP NAS"),
+        ("nginx", "nginx"),
+        ("microsoft-iis", "Microsoft IIS"),
+        ("apache", "Apache"),
+        ("lighttpd", "lighttpd"),
+        ("boa", "Boa embedded web"),
+        ("goahead", "GoAhead embedded web"),
+        ("realm=\"ip camera", "IP Camera 摄像头"),
+        ("rtsp", "RTSP 视频服务"),
+    ];
+
+    for (needle, label) in rules {
+        if lower.contains(needle) {
+            push_unique(&mut fingerprints, label.to_string());
+        }
+    }
+
+    fingerprints
+}
+
 fn clean_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -537,6 +765,147 @@ fn truncate(value: String, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn write_reports(context: &NetworkContext, results: &[HostInfo]) -> io::Result<Vec<String>> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let base = format!("listlanhost-report-{timestamp}");
+    let txt_path = format!("{base}.txt");
+    let csv_path = format!("{base}.csv");
+    let json_path = format!("{base}.json");
+
+    write_txt_report(&txt_path, context, results)?;
+    write_csv_report(&csv_path, results)?;
+    write_json_report(&json_path, context, results)?;
+
+    Ok(vec![txt_path, csv_path, json_path])
+}
+
+fn write_txt_report(path: &str, context: &NetworkContext, results: &[HostInfo]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "listlanhost {VERSION} report")?;
+    writeln!(file, "Interface: {}", context.interface_name)?;
+    writeln!(file, "Local IPv4: {}/{}", context.local_ip, context.prefix_len)?;
+    writeln!(
+        file,
+        "Default Gateway: {}",
+        context
+            .default_gateway
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    )?;
+    writeln!(file, "Scanned Hosts: {}", context.host_count)?;
+    writeln!(file, "Online Hosts: {}", results.len())?;
+    writeln!(file)?;
+
+    for host in results {
+        writeln!(file, "{} [{}]", host.ip, host.group)?;
+        writeln!(file, "  Default Gateway: {}", host.is_default_gateway)?;
+        writeln!(file, "  Hints: {}", join_or_dash(&host.hints))?;
+        writeln!(file, "  Services: {}", join_or_dash(&host.services))?;
+        writeln!(file, "  URLs: {}", join_or_dash(&host.urls))?;
+        writeln!(file, "  Fingerprints: {}", join_or_dash(&host.fingerprints))?;
+        writeln!(file, "  HTTP: {}", join_or_dash(&host.http.iter().map(HttpProbeInfo::display_line).collect::<Vec<_>>()))?;
+        writeln!(file, "  RTSP: {}", join_or_dash(&host.rtsp.iter().map(RtspProbeInfo::display_line).collect::<Vec<_>>()))?;
+        writeln!(file)?;
+    }
+
+    Ok(())
+}
+
+fn write_csv_report(path: &str, results: &[HostInfo]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "ip,group,is_default_gateway,hints,services,urls,fingerprints,http,rtsp"
+    )?;
+
+    for host in results {
+        let http = host.http.iter().map(HttpProbeInfo::display_line).collect::<Vec<_>>();
+        let rtsp = host.rtsp.iter().map(RtspProbeInfo::display_line).collect::<Vec<_>>();
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{}",
+            csv_escape(&host.ip.to_string()),
+            csv_escape(&host.group),
+            csv_escape(&host.is_default_gateway.to_string()),
+            csv_escape(&host.hints.join(" | ")),
+            csv_escape(&host.services.join(" | ")),
+            csv_escape(&host.urls.join(" | ")),
+            csv_escape(&host.fingerprints.join(" | ")),
+            csv_escape(&http.join(" | ")),
+            csv_escape(&rtsp.join(" | "))
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_json_report(path: &str, context: &NetworkContext, results: &[HostInfo]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    writeln!(file, "{{")?;
+    writeln!(file, "  \"version\": {},", json_string(VERSION))?;
+    writeln!(file, "  \"interface\": {},", json_string(&context.interface_name))?;
+    writeln!(file, "  \"local_ip\": {},", json_string(&context.local_ip.to_string()))?;
+    writeln!(file, "  \"prefix_len\": {},", context.prefix_len)?;
+    writeln!(
+        file,
+        "  \"default_gateway\": {},",
+        context
+            .default_gateway
+            .map(|ip| json_string(&ip.to_string()))
+            .unwrap_or_else(|| "null".to_string())
+    )?;
+    writeln!(file, "  \"scanned_hosts\": {},", context.host_count)?;
+    writeln!(file, "  \"hosts\": [")?;
+
+    for (index, host) in results.iter().enumerate() {
+        let comma = if index + 1 == results.len() { "" } else { "," };
+        writeln!(file, "    {{")?;
+        writeln!(file, "      \"ip\": {},", json_string(&host.ip.to_string()))?;
+        writeln!(file, "      \"group\": {},", json_string(&host.group))?;
+        writeln!(file, "      \"is_default_gateway\": {},", host.is_default_gateway)?;
+        writeln!(file, "      \"hints\": {},", json_array(&host.hints))?;
+        writeln!(file, "      \"services\": {},", json_array(&host.services))?;
+        writeln!(file, "      \"urls\": {},", json_array(&host.urls))?;
+        writeln!(file, "      \"fingerprints\": {},", json_array(&host.fingerprints))?;
+        writeln!(file, "      \"http\": {},", json_array(&host.http.iter().map(HttpProbeInfo::display_line).collect::<Vec<_>>()))?;
+        writeln!(file, "      \"rtsp\": {}", json_array(&host.rtsp.iter().map(RtspProbeInfo::display_line).collect::<Vec<_>>()))?;
+        writeln!(file, "    }}{comma}")?;
+    }
+
+    writeln!(file, "  ]")?;
+    writeln!(file, "}}")?;
+    Ok(())
+}
+
+fn csv_escape(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn json_array(values: &[String]) -> String {
+    let items = values.iter().map(|value| json_string(value)).collect::<Vec<_>>();
+    format!("[{}]", items.join(", "))
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn is_web_port(port: u16) -> bool {
@@ -564,6 +933,10 @@ fn has_any(values: &[u16], needles: &[u16]) -> bool {
 
 fn contains_hint(hints: &[String], needle: &str) -> bool {
     hints.iter().any(|hint| hint.contains(needle))
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
 }
 
 fn push_unique(values: &mut Vec<String>, value: String) {
